@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_pwd
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: haproxy-lb
+    depends_on:
+      - postgres
+    ports:
+      - "5439:5432"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  api:
+    build: ./api
+    container_name: node-api
+    depends_on:
+      - haproxy
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://app:app_pwd@haproxy:5432/appdb
+      - READ_REPLICA_URL=postgresql://app:app_pwd@postgres:5432/appdb
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./api:/app
+      - /app/node_modules
+
+volumes:
+  pgdata:

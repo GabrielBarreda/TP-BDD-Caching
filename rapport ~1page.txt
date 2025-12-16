@@ -1,0 +1,172 @@
+📊 1. Schéma d’Architecture Réalisée
+
+┌─────────────────┐
+│     CLIENT      │
+│   (PowerShell/  │
+│     Postman)    │
+└────────┬────────┘
+         │ HTTP:3000
+         ▼
+┌─────────────────┐
+│    API Node.js  │
+│  (Express.js)   │
+│  Port: 3000     │
+└───┬─────────┬───┘
+    │         │
+    │ Écriture│ Lecture
+    ▼         ▼
+┌─────────────────┐  ┌─────────────────┐
+│  PostgreSQL 16  │  │    Redis 7      │
+│    Primary      │  │     Cache       │
+│  Port: 5432     │  │  Port: 6379     │
+└─────────────────┘  └─────────────────┘
+
+
+Services Docker déployés :
+
+✅ postgres : Base de données unique (sans réplica)
+
+✅ redis : Cache en mémoire
+
+✅ api : Application backend Node.js
+
+⚠️ haproxy : Présent mais sous-utilisé (manque de réplica)
+
+État final :
+
+
+Containers: 3/4 actifs
+Réplication: Échec
+Cache: Fonctionnel
+Haute Disponibilité: Non implémentée
+
+
+🔄 2. Stratégie de Lecture/Écriture
+Flux des écritures :
+
+Client → API Node.js → PostgreSQL (direct)
+                     ↓
+              Invalidation cache Redis
+Flux des lectures :
+
+Client → API Node.js → Vérification cache Redis
+                     ↓ (si cache MISS)
+                     PostgreSQL (direct)
+                     ↓
+              Mise en cache Redis (TTL 60s)
+Code réel implémenté :
+javascript
+// Écriture
+app.post('/products', (req, res) => {
+  // Direct vers PostgreSQL
+  writePool.query('INSERT INTO products...');
+});
+
+// Lecture avec cache
+app.get('/products/:id', async (req, res) => {
+  // 1. Redis d'abord
+  const cached = await redisClient.get(`product:${id}`);
+  if (cached) return res.json({ source: 'cache', data: JSON.parse(cached) });
+  
+  // 2. Sinon PostgreSQL
+  const result = await readPool.query('SELECT * FROM products WHERE id = $1', [id]);
+  
+  // 3. Cache pour next time
+  await redisClient.setEx(`product:${id}`, 60, JSON.stringify(result.rows[0]));
+});
+🗃️ 3. Stratégie de Cache Redis
+Pattern : Cache-Aside (Lazy Loading)
+Clés : product:{id}
+
+TTL : 60 secondes
+
+Invalidation : Sur modification (PUT /products/:id)
+
+Résilience : Timeout 1 seconde + fallback PostgreSQL
+
+Amélioration de résilience ajoutée :
+javascript
+// Version finale avec timeout
+async function safeRedisGet(key) {
+  try {
+    return await Promise.race([
+      redisClient.get(key),
+      new Promise((_, reject) => 
+        setTimeout(() => reject('Timeout'), 1000)
+      )
+    ]);
+  } catch {
+    return null; // Fallback silencieux vers PostgreSQL
+  }
+}
+Scénarios gérés :
+Cache HIT : Données retournées depuis Redis (~5ms)
+
+Cache MISS : PostgreSQL → Redis → Client (~50ms)
+
+Redis down : PostgreSQL direct (~50ms + 1s timeout)
+
+PostgreSQL down : Service indisponible (SPOF)
+
+📈 4. Mesures Avant/Après Cache
+Tests effectués :
+Scénario	Temps Réponse	Source	Gain
+Sans cache (premier appel)	40-60ms	PostgreSQL	Baseline
+Avec cache (HIT)	5-10ms	Redis	5-6x plus rapide
+Cache MISS	40-60ms	PostgreSQL	Identique
+Redis indisponible	1040-1060ms	PostgreSQL + timeout	Plus lent mais fonctionnel
+Données réelles :
+powershell
+# Premier appel (MISS)
+>>> source: database, cache: available
+>>> Temps: ~52ms
+
+# Deuxième appel (HIT)  
+>>> source: cache, data: {...}
+>>> Temps: ~7ms
+
+# Redis arrêté + fallback
+>>> source: database, cache: unavailable  
+>>> Temps: ~1052ms (inclut timeout 1s)
+Analyse :
+✅ Performance : Amélioration 5-6x sur données fréquentes
+
+✅ Résilience : Service survit à la panne Redis
+
+⚠️ Latence : Timeout de 1s perceptible quand Redis down
+
+❌ Disponibilité : PostgreSQL reste un point de défaillance unique
+
+⚠️ 5. Retour sur la Haute Disponibilité
+Objectif initial vs Réalité :
+Objectif du TP :
+
+PostgreSQL Primary ──réplication──▶ PostgreSQL Replica
+       │                                   │
+       └─────HAProxy (routing)───────┘
+Réalité atteinte :
+
+PostgreSQL Primary (seul)
+       │
+       └── API (cache Redis)
+
+Configuration réplication :
+
+yaml
+# Tentative échouée
+db-replica:
+  image: postgres:16
+  command: >
+    bash -c "
+    pg_basebackup -h db-primary -U repl -D /data -R
+    postgres -c hot_standby=on
+    "
+# Résultat : pg_is_in_recovery() retournait 'f' au lieu de 't'
+
+
+
+Leçons apprises :
+Réplication ≠ Haute Disponibilité
+La réplication copie les données
+La HA nécessite un mécanisme de basculement automatique
+
